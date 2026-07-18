@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState, useEffect, useCallback } from "react";
+import { useRef, useState, useEffect, useCallback, useMemo } from "react";
 import Link from "next/link";
 import { useCircleNav } from "./CircleTransition";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
@@ -9,6 +9,34 @@ import * as THREE from "three";
 import { artworks, Artwork } from "../data/artworks";
 
 type ViewMode = "sphere" | "cylinder";
+
+// Phone screens get a thinned-out gallery so the sphere/cylinder don't feel
+// overcrowded on a small viewport. PHONE_BREAKPOINT matches the md: breakpoint
+// used elsewhere in this file for phone-specific styling.
+const PHONE_BREAKPOINT = "(max-width: 767px)";
+const PHONE_ARTWORK_COUNT = 17;
+
+function useIsPhone(): boolean {
+  const [isPhone, setIsPhone] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia(PHONE_BREAKPOINT);
+    const update = () => setIsPhone(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, []);
+  return isPhone;
+}
+
+// Evenly samples `count` items across the full list by index (rather than
+// just truncating the tail) so the trimmed set still reads as evenly spaced
+// once fed into the sphere/cylinder position math, which distributes purely
+// by index order and total count.
+function sampleEvenly<T>(list: T[], count: number): T[] {
+  if (list.length <= count) return list;
+  const step = list.length / count;
+  return Array.from({ length: count }, (_, i) => list[Math.floor(i * step)]);
+}
 
 // Camera sits well outside the structure (see CAMERA_Z below) so these
 // radii are kept tight — the cluster reads as one compact, cohesive
@@ -56,6 +84,9 @@ const CYLINDER_TOTAL_TURNS = 2.5;
 const CYLINDER_HEIGHT_STEP = 0.75;
 const CYLINDER_SCROLL_ROTATE_RATE = 0.0025;
 const CYLINDER_SCROLL_RISE_RATE = 0.01;
+// Touch drag pixels are much smaller per-event than wheel deltaY, so scale
+// them up to feel comparably responsive when swiping the helix.
+const CYLINDER_DRAG_SCROLL_SCALE = 4;
 
 function getCylinderPosition(i: number, total: number): [number, number, number] {
   const angleStep = (Math.PI * 2 * CYLINDER_TOTAL_TURNS) / total;
@@ -75,9 +106,15 @@ interface ImageMeshProps {
   onSelect: (id: number | null) => void;
   hovered: number | null;
   onHover: (id: number | null) => void;
+  revealed: boolean;
 }
 
-function ImageMesh({ artwork, index, total, viewMode, clicked, onSelect, hovered, onHover }: ImageMeshProps) {
+// World-unit drop below each mesh's true target — while unrevealed, meshes
+// mount this far below their spot so the intro reveal reads as photos
+// sliding up from the bottom instead of just fading in place.
+const REVEAL_DROP = 5;
+
+function ImageMesh({ artwork, index, total, viewMode, clicked, onSelect, hovered, onHover, revealed }: ImageMeshProps) {
   const meshRef = useRef<THREE.Mesh>(null);
   const texture = useTexture(artwork.src);
   const isSelected = clicked === artwork.id;
@@ -99,8 +136,16 @@ function ImageMesh({ artwork, index, total, viewMode, clicked, onSelect, hovered
   // Set the starting position once on mount only — it must never be a
   // reactive JSX prop, or every viewMode/clicked change would snap the
   // mesh straight to its new target instead of letting useFrame lerp it.
+  // If the intro splash hasn't revealed yet, start dropped below the true
+  // target so the normal per-frame lerp (below) carries it upward into
+  // place once revealed flips true — that's the whole "slide up" effect.
   useEffect(() => {
-    meshRef.current?.position.copy(posRef.current);
+    if (!meshRef.current) return;
+    const start = revealed
+      ? posRef.current
+      : posRef.current.clone().setY(posRef.current.y - REVEAL_DROP);
+    meshRef.current.position.copy(start);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const FOCAL_TARGET = useRef(new THREE.Vector3(FOCAL_X_FALLBACK, 0, FOCAL_Z));
@@ -115,7 +160,7 @@ function ImageMesh({ artwork, index, total, viewMode, clicked, onSelect, hovered
   const planeH = aspect >= 1 ? 1.5 / aspect : 1.5;
 
   useFrame(({ camera }) => {
-    if (!meshRef.current) return;
+    if (!meshRef.current || !revealed) return;
     const mat = meshRef.current.material as THREE.MeshBasicMaterial;
 
     let targetOpacity: number;
@@ -226,13 +271,17 @@ function ImageMesh({ artwork, index, total, viewMode, clicked, onSelect, hovered
 }
 
 function Scene({
+  items,
   viewMode,
   clicked,
   onSelect,
+  revealed,
 }: {
+  items: Artwork[];
   viewMode: ViewMode;
   clicked: number | null;
   onSelect: (id: number | null) => void;
+  revealed: boolean;
 }) {
   const { camera } = useThree();
   const groupRef = useRef<THREE.Group>(null);
@@ -252,7 +301,10 @@ function Scene({
   }, [camera]);
 
   useFrame(() => {
-    if (!groupRef.current) return;
+    // Hold the whole group still (no auto-rotate, no scroll-driven helix)
+    // while the intro splash is still up — nothing should be spinning
+    // behind a black screen the user can't see yet.
+    if (!groupRef.current || !revealed) return;
 
     if (clicked !== null) {
       // Return the group to a neutral pose while a piece is focused so
@@ -312,12 +364,27 @@ function Scene({
 
   const handlePointerMove = useCallback((e: { clientX: number; clientY: number }) => {
     if (!isDragging.current || clicked !== null) return;
-    const dx = (e.clientX - lastMouse.current.x) * 0.003;
-    const dy = (e.clientY - lastMouse.current.y) * 0.003;
-    velocity.current.x = dx;
-    velocity.current.y = dy;
+
+    if (viewMode === "cylinder") {
+      // Touchscreens never emit wheel events, so drag/swipe has to drive the
+      // same scroll accumulator wheel does — otherwise the helix is
+      // completely inert on touch. Dragging up feeds new photos in, matching
+      // the "swipe up to scroll down" convention.
+      const maxScrollAccum =
+        (((items.length - 1) * CYLINDER_HEIGHT_STEP) / 2) / CYLINDER_SCROLL_RISE_RATE;
+      scrollAccum.current = THREE.MathUtils.clamp(
+        scrollAccum.current - (e.clientY - lastMouse.current.y) * CYLINDER_DRAG_SCROLL_SCALE,
+        -maxScrollAccum,
+        maxScrollAccum
+      );
+    } else {
+      const dx = (e.clientX - lastMouse.current.x) * 0.003;
+      const dy = (e.clientY - lastMouse.current.y) * 0.003;
+      velocity.current.x = dx;
+      velocity.current.y = dy;
+    }
     lastMouse.current = { x: e.clientX, y: e.clientY };
-  }, [clicked]);
+  }, [clicked, viewMode, items.length]);
 
   const handlePointerUp = useCallback(() => {
     isDragging.current = false;
@@ -331,7 +398,7 @@ function Scene({
         // or last photo just locks in place instead of drifting into
         // empty space beyond the ends.
         const maxScrollAccum =
-          (((artworks.length - 1) * CYLINDER_HEIGHT_STEP) / 2) / CYLINDER_SCROLL_RISE_RATE;
+          (((items.length - 1) * CYLINDER_HEIGHT_STEP) / 2) / CYLINDER_SCROLL_RISE_RATE;
         scrollAccum.current = THREE.MathUtils.clamp(
           scrollAccum.current + e.deltaY,
           -maxScrollAccum,
@@ -345,7 +412,7 @@ function Scene({
         velocity.current.y += e.deltaY * 0.00012;
       }
     },
-    [clicked, viewMode]
+    [clicked, viewMode, items.length]
   );
 
   useEffect(() => {
@@ -363,29 +430,35 @@ function Scene({
 
   return (
     <group ref={groupRef}>
-      {artworks.map((art, i) => (
+      {items.map((art, i) => (
         <ImageMesh
           key={art.id}
           artwork={art}
           index={i}
-          total={artworks.length}
+          total={items.length}
           viewMode={viewMode}
           clicked={clicked}
           onSelect={onSelect}
           hovered={hovered}
           onHover={setHovered}
+          revealed={revealed}
         />
       ))}
     </group>
   );
 }
 
-export default function Gallery() {
+export default function Gallery({ revealed = true }: { revealed?: boolean }) {
   const navigate = useCircleNav();
   const [viewMode, setViewMode] = useState<ViewMode>("sphere");
   const [clicked, setClicked] = useState<number | null>(null);
   const [detailArt, setDetailArt] = useState<Artwork | null>(null);
   const [prevClicked, setPrevClicked] = useState<number | null>(null);
+  const isPhone = useIsPhone();
+  const sceneArtworks = useMemo(
+    () => (isPhone ? sampleEvenly(artworks, PHONE_ARTWORK_COUNT) : artworks),
+    [isPhone]
+  );
 
   // detailArt intentionally lags behind `clicked` on close — it keeps the
   // last-selected artwork's text in the DOM while the container's opacity
@@ -422,14 +495,14 @@ export default function Gallery() {
         onPointerMissed={handleClose}
       >
         <ambientLight intensity={1} />
-        <Scene viewMode={viewMode} clicked={clicked} onSelect={handleSelect} />
+        <Scene items={sceneArtworks} viewMode={viewMode} clicked={clicked} onSelect={handleSelect} revealed={revealed} />
       </Canvas>
 
       {/* HUD Overlay — fixed framework, all children re-declare the same
           padding since absolutely-positioned elements don't inherit it. */}
       <div className="fixed inset-0 pointer-events-none p-5 md:p-8 z-50">
         {/* Top navbar */}
-        <div className="absolute top-0 left-0 right-0 pl-4 md:pl-8 pr-4 md:pr-8 pt-4 md:pt-6 pb-4 md:pb-8 flex justify-between items-center gap-3 md:gap-0">
+        <div className="absolute top-0 left-0 right-0 pl-4 md:pl-8 pr-4 md:pr-8 pt-4 md:pt-6 pb-4 md:pb-8 flex justify-between items-center gap-3 md:gap-0 bg-[#E7D8BC] md:bg-transparent pointer-events-auto">
           <div className="pointer-events-auto shrink-0">
             <h1
               className="text-lg md:text-2xl font-black leading-none tracking-tight text-[#2C2520]"
@@ -492,7 +565,7 @@ export default function Gallery() {
           `clicked` on close so it stays in the DOM through the fade-out
           instead of popping. */}
       <div
-        className={`absolute top-0 right-0 h-full w-1/3 p-20 md:p-24 flex flex-col justify-center items-start text-left gap-4 transition-opacity duration-500 ${
+        className={`absolute top-0 right-0 h-full w-1/2 md:w-1/3 p-6 sm:p-14 md:p-24 flex flex-col justify-center items-start text-left gap-4 transition-opacity duration-500 ${
           clicked !== null ? "opacity-100 pointer-events-auto" : "opacity-0 pointer-events-none"
         }`}
         style={{ zIndex: 10 }}
@@ -500,19 +573,19 @@ export default function Gallery() {
         {detailArt && (
           <>
             <h2
-              className="text-3xl font-bold text-[#2C2520]"
+              className="text-xl sm:text-2xl md:text-3xl font-bold text-[#2C2520] break-words"
               style={{ fontFamily: "var(--font-playfair)" }}
             >
               {detailArt.title}
             </h2>
             <p
-              className="text-xs uppercase tracking-widest text-[#2C2520]/60"
+              className="hidden sm:block text-xs uppercase tracking-widest text-[#2C2520]/60"
               style={{ fontFamily: "var(--font-inter)" }}
             >
               {detailArt.year}
             </p>
             <p
-              className="text-sm leading-relaxed text-[#2C2520]/80"
+              className="hidden sm:block text-sm leading-relaxed text-[#2C2520]/80"
               style={{ fontFamily: "var(--font-inter)", fontWeight: 300 }}
             >
               {detailArt.description}
