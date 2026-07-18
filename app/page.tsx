@@ -1,12 +1,29 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useLayoutEffect, useState } from "react";
 import Gallery from "./components/Gallery";
 import IntroSplash from "./components/IntroSplash";
 
+const INTRO_SEEN_KEY = "khuushi-intro-seen";
+
 export default function Home() {
   const [revealed, setRevealed] = useState(false);
-  const handleIntroComplete = useCallback(() => setRevealed(true), []);
+  const [showSplash, setShowSplash] = useState(true);
+
+  // Runs before paint on every mount (including navigating back to "/" from
+  // another page) — if the intro already played this browser session, skip
+  // it and jump straight to revealed with no visible flash of the splash.
+  useLayoutEffect(() => {
+    if (sessionStorage.getItem(INTRO_SEEN_KEY) === "true") {
+      setShowSplash(false);
+      setRevealed(true);
+    }
+  }, []);
+
+  const handleIntroComplete = useCallback(() => {
+    setRevealed(true);
+    sessionStorage.setItem(INTRO_SEEN_KEY, "true");
+  }, []);
 
   return (
     <main
@@ -14,7 +31,7 @@ export default function Home() {
       style={{ touchAction: "none" }}
     >
       <Gallery revealed={revealed} />
-      <IntroSplash onComplete={handleIntroComplete} />
+      {showSplash && <IntroSplash onComplete={handleIntroComplete} />}
     </main>
   );
 }
